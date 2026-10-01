@@ -1,0 +1,198 @@
+# n8n (self-hosted) with Agents + n8n Assistant (local n8n-sandbox)
+# See README.md for the step-by-step setup.
+#
+# Secrets come from .env (mode 600). Each container gets ONLY the variables it needs
+# (no env_file) — the model key and encryption key never reach the sandbox containers.
+name: n8n
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+networks:
+  app:        # n8n <-> task runners
+  sandbox:    # n8n <-> sandbox-api <-> sandbox-runner (no host ports)
+
+volumes:
+  sandbox-tls:      # mTLS certs for sandbox-api / sandbox-runner
+  sandbox-docker:   # inner Docker of sandbox-runner (caches the sandbox image)
+
+services:
+
+  # ---------------------------------------------------------------- n8n
+  n8n:
+    image: n8nio/n8n:${N8N_VERSION:?}
+    container_name: n8n
+    runtime: runc                      # host default is nvidia; n8n needs no GPU
+    restart: "no"                      # development: no auto-start on reboot
+    ports:
+      - "127.0.0.1:${N8N_HOST_PORT:-5678}:5678"   # this host only, not LAN/IPv6
+    networks: [app, sandbox]
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Ollama, LM Studio, Supabase on the host
+    logging: *logging
+    environment:
+      # --- base
+      GENERIC_TIMEZONE: ${TZ:-UTC}        # set TZ in .env
+      TZ: ${TZ:-UTC}
+      N8N_HOST: localhost
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: http
+      N8N_EDITOR_BASE_URL: http://localhost:${N8N_HOST_PORT:-5678}/
+      N8N_WEBHOOK_URL: http://localhost:${N8N_HOST_PORT:-5678}/
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?}          # key lives in .env, not only in n8n_data
+      # --- database (SQLite)
+      DB_TYPE: sqlite
+      DB_SQLITE_VACUUM_ON_STARTUP: "true"
+      # --- executions
+      EXECUTIONS_DATA_MAX_AGE: ${EXECUTIONS_DATA_MAX_AGE:-5000}   # hours
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: "10000"
+      EXECUTIONS_TIMEOUT: ${EXECUTIONS_TIMEOUT:-900}              # seconds, default per workflow
+      EXECUTIONS_TIMEOUT_MAX: "3600"
+      # --- no contact with n8n servers (docs: "Isolate n8n")
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_TEMPLATES_ENABLED: "false"
+      EXTERNAL_FRONTEND_HOOKS_URLS: ""
+      N8N_DIAGNOSTICS_CONFIG_FRONTEND: ""
+      N8N_DIAGNOSTICS_CONFIG_BACKEND: ""
+      N8N_AI_GATEWAY_ENABLED: "false"          # n8n Cloud AI credits
+      N8N_AI_ALLOW_SENDING_PARAMETER_VALUES: "false"   # AI (Assistant) gets field names/types, not actual data values
+      N8N_HIRING_BANNER_ENABLED: "false"
+      # --- modules: Agents + Assistant on; modules that call api.n8n.io off
+      N8N_ENABLED_MODULES: agents,instance-ai
+      N8N_DISABLED_MODULES: mcp-registry,community-packages,quick-connect
+      N8N_COMMUNITY_PACKAGES_ENABLED: "false"
+      # --- security
+      # 2FA: enforcement (N8N_MFA_ENFORCED_ENABLED) needs a Business license — ignored on
+      # Community. Each user must enable 2FA manually (Settings > Personal).
+      N8N_MCP_MANAGED_BY_ENV: "true"
+      N8N_MCP_ACCESS_ENABLED: "false"          # MCP server off until needed
+      N8N_PUBLIC_API_DISABLED: "true"
+      N8N_PUBLIC_API_SWAGGERUI_DISABLED: "true"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"     # default in code; set explicitly
+      N8N_BLOCK_FILE_ACCESS_TO_N8N_FILES: "true"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      # --- Code node: external task runners (separate container)
+      N8N_RUNNERS_MODE: external
+      N8N_RUNNERS_BROKER_LISTEN_ADDRESS: 0.0.0.0   # reachable on 'app' network only, port not published
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:?}
+      # --- n8n Assistant (instance-ai)
+      # Model: managed in the UI (Settings > n8n Assistant). Do NOT set N8N_INSTANCE_AI_MODEL*
+      # here — any env value locks the UI field.
+      N8N_INSTANCE_AI_SANDBOX_ENABLED: "true"
+      N8N_INSTANCE_AI_SANDBOX_PROVIDER: n8n-sandbox
+      N8N_SANDBOX_SERVICE_URL: http://sandbox-api:8080
+      N8N_SANDBOX_SERVICE_API_KEY: ${SANDBOX_API_KEY:?}
+      N8N_INSTANCE_AI_BROWSER_USE_ENABLED: "false"     # no control of users' browsers
+      N8N_INSTANCE_AI_LOCAL_GATEWAY_DISABLED: "true"   # no companion app on users' PCs
+      N8N_INSTANCE_AI_MAX_CONCURRENT_RUNS: "2"
+
+  # ---------------------------------------------------------------- task runners (Code node)
+  runners:
+    image: n8nio/runners:${N8N_VERSION:?}    # must match n8n version
+    container_name: n8n-runners
+    runtime: runc
+    restart: "no"
+    networks: [app]
+    depends_on: [n8n]
+    logging: *logging
+    environment:
+      N8N_RUNNERS_TASK_BROKER_URI: http://n8n:5679
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:?}
+      N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT: "15"
+
+  # ---------------------------------------------------------------- sandbox for n8n Assistant
+  # Profile 'assistant': NOT started by plain `docker compose up`.
+  # Start:  docker compose --profile assistant up -d   Stop: docker compose --profile assistant stop sandbox-runner-1 sandbox-api
+  # One-shot: creates mTLS certs, then exits. Certs do NOT auto-renew.
+  # Differs from n8n's reference compose: no --world-readable, keys not readable by others.
+  sandbox-certs:
+    profiles: [assistant]              # starts only with --profile assistant
+    image: ghcr.io/n8n-io/n8n-sandbox-service-api:${N8N_SANDBOX_VERSION:?}
+    runtime: runc
+    user: "0:0"
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        bootstrap-mtls.sh --out-dir /tls --api-san sandbox-api
+        --control-san-prefix sandbox-runner &&
+        chown -R sandbox-api:sandbox-api /tls/api &&
+        chmod -R go-rwx /tls/api /tls/runner
+    environment:
+      NUM_RUNNERS: "1"
+    volumes:
+      - sandbox-tls:/tls
+    logging: *logging
+
+  sandbox-api:
+    profiles: [assistant]              # starts only with --profile assistant
+    image: ghcr.io/n8n-io/n8n-sandbox-service-api:${N8N_SANDBOX_VERSION:?}
+    container_name: n8n-sandbox-api
+    runtime: runc
+    restart: "no"
+    networks: [sandbox]                 # never publish 8080/9090
+    depends_on:
+      sandbox-certs:
+        condition: service_completed_successfully
+    volumes:
+      - sandbox-tls:/tls:ro
+    logging: *logging
+    environment:
+      SANDBOX_API_KEYS: ${SANDBOX_API_KEY:?}
+      SANDBOX_API_RUNNER_REGISTRATION_TOKEN: ${SANDBOX_RUNNER_REGISTRATION_TOKEN:?}
+      SANDBOX_API_RUNNER_API_KEY: ${SANDBOX_RUNNER_API_KEY:?}
+      SANDBOX_API_GRPC_TLS_CERT_FILE: /tls/api/grpc-server.crt
+      SANDBOX_API_GRPC_TLS_KEY_FILE: /tls/api/grpc-server.key
+      SANDBOX_API_GRPC_TLS_CLIENT_CA_FILE: /tls/api/ca.crt
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CA_FILE: /tls/api/ca.crt
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CERT_FILE: /tls/api/control-grpc-api-client.crt
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_KEY_FILE: /tls/api/control-grpc-api-client.key
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_SERVER_NAME: sandbox-runner-1
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # PRIVILEGED (Docker-in-Docker): equivalent to root on the host.
+  # Run the stack only while developing; stop it afterwards. Future option: Sysbox.
+  sandbox-runner-1:
+    profiles: [assistant]              # starts only with --profile assistant
+    image: ghcr.io/n8n-io/n8n-sandbox-service-runner-dind:${N8N_SANDBOX_VERSION:?}
+    container_name: n8n-sandbox-runner
+    runtime: runc
+    privileged: true
+    restart: "no"
+    networks: [sandbox]                 # never publish ports
+    depends_on:
+      sandbox-api:
+        condition: service_healthy
+    mem_limit: 4g                       # caps runner + all sandboxes
+    cpus: 4
+    volumes:
+      - sandbox-tls:/tls:ro
+      - sandbox-docker:/var/lib/docker
+    logging: *logging
+    environment:
+      SANDBOX_RUNNER_API_KEYS: ${SANDBOX_RUNNER_API_KEY:?}
+      SANDBOX_RUNNER_REGISTRATION_TOKEN: ${SANDBOX_RUNNER_REGISTRATION_TOKEN:?}
+      SANDBOX_RUNNER_API_GRPC_ADDR: sandbox-api:9090
+      SANDBOX_RUNNER_HTTP_BASE_URL: https://sandbox-runner-1:8080
+      SANDBOX_RUNNER_CONTROL_GRPC_LISTEN_ADDR: ":9091"
+      SANDBOX_RUNNER_CONTROL_GRPC_ADVERTISE_ADDR: sandbox-runner-1:9091
+      SANDBOX_RUNNER_ID: runner-1
+      SANDBOX_RUNNER_CAPACITY_TOTAL: "5"          # max sandboxes at once (default 1000)
+      SANDBOX_RUNNER_DOCKER_SANDBOX_IMAGE: ghcr.io/n8n-io/n8n-sandbox-service-sandbox:${N8N_SANDBOX_VERSION:?}
+      SANDBOX_RUNNER_REGISTRATION_GRPC_CA_FILE: /tls/runner/ca.crt
+      SANDBOX_RUNNER_REGISTRATION_GRPC_CERT_FILE: /tls/runner/grpc-client.crt
+      SANDBOX_RUNNER_REGISTRATION_GRPC_KEY_FILE: /tls/runner/grpc-client.key
+      SANDBOX_RUNNER_REGISTRATION_GRPC_SERVER_NAME: sandbox-api
+      SANDBOX_RUNNER_CONTROL_GRPC_TLS_CERT_FILE: /tls/runner/control-grpc-server.crt
+      SANDBOX_RUNNER_CONTROL_GRPC_TLS_KEY_FILE: /tls/runner/control-grpc-server.key
+      SANDBOX_RUNNER_CONTROL_GRPC_TLS_CLIENT_CA_FILE: /tls/runner/ca.crt

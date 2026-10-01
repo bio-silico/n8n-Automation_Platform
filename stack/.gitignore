@@ -1,0 +1,6 @@
+# secrets and runtime data — never commit
+.env
+n8n_data/
+ops-archive/
+*.sqlite
+*.sqlite-*
